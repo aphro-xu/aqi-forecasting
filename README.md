@@ -1,5 +1,5 @@
 # aqi-forecasting
-Created by wofmanaf
+Created by wofmanaf， the main model we use is resnet!
 
 ### Requirements
 * Keras 2.0.6
