@@ -1,12 +1,15 @@
+#!/usr/bin/env python3
+# coding=utf-8
+
 from __future__ import (absolute_import, division, print_function)
 
 from sklearn.model_selection import train_test_split
 from sklearn import preprocessing
 
 from keras.models import Model
-from keras.layers.core import Dense, Dropout
-from keras.layers import Input
-from keras.layers.merge import add
+from keras.layers.core import Dense, Dropout, Activation
+from keras.layers import Input, LSTM, TimeDistributed
+from keras.layers.merge import Add
 from keras.layers.normalization import BatchNormalization
 from keras.layers import Dropout
 from keras.regularizers import l2
@@ -18,8 +21,6 @@ import pandas as pd
 data_file = "./data_set/pt.csv"
 input_size = 5
 output_size = 8
-time_steps = 24
-cell_size = 20
 batch_size = 200
 
 cols = ['aqi', 'SO2', 'NO2', 'P10', 'P2.5', 'O3', 'CO', 'Humi-R', 'W-Direc', 'W-Speed', 'A-Pres', 'A-Temp', 'date', 'time']
@@ -65,38 +66,68 @@ test_X = normalizer.transform(test_X)
 train_y = np_utils.to_categorical(train_y, num_classes=output_size)
 test_y = np_utils.to_categorical(test_y, num_classes=output_size)
 
-def add_layer(inpt, dropout_rate=0.5, bk_size=100, weight_decay=1E-4):
+
+def add_layer(inpt, bk_size=100, dropout_rate=None, weight_decay=1E-4):
     x = Dense(bk_size, activation='relu', kernel_initializer='he_normal',
               kernel_regularizer=l2(weight_decay))(inpt)
-    x = Dropout(rate=dropout_rate)(x)
+    if dropout_rate is not None:
+        x = Dropout(rate=dropout_rate)(x)
     return x
 
-def resblock(x, dropout_rate=0.5,bk_size=50, weight_decay=1E-4):
-    out = add_layer(x, dropout_rate, bk_size, weight_decay)
-    out = add([out, x])
-    out = BatchNormalization(axis=-1, gamma_regularizer=l2(weight_decay), beta_regularizer=l2(weight_decay))(out)
-    out = Dropout(rate=dropout_rate)(out)
-    return out
 
-inpt = Input(shape=(input_size,))
+def transition_block(x, bk_size=100, dropout_rate=0.5, weight_decay=1E-4):
+    x = Dense(bk_size, activation='relu', kernel_initializer='he_normal',
+              kernel_regularizer=l2(weight_decay))(x)
+    x = Dropout(rate=dropout_rate)(x)
+    x = BatchNormalization(axis=-1, momentum=0.99, gamma_regularizer=l2(weight_decay),
+                           beta_regularizer=l2(weight_decay))(x)
+    return x
 
-x = add_layer(inpt, dropout_rate=0.5, bk_size=50, weight_decay=1E-4)
 
-# resblock 1
-x = resblock(x, dropout_rate=0.5, bk_size=50, weight_decay=1E-4)
+def resblock(x, nb_layers, dropout_rate=None, bk_size=100, weight_decay=1E-4):
+    feature_list = [x]
+    for i in range(nb_layers):
+        x = add_layer(x, dropout_rate, bk_size, weight_decay)
+        feature_list.append(x)
+        x = Add()(feature_list)
+    x = BatchNormalization(axis=-1, momentum=0.99, gamma_regularizer=l2(weight_decay),
+                           beta_regularizer=l2(weight_decay))(x)
+    bk_size = int(bk_size/2)
+    return x, bk_size
 
-# transition block
-x = add_layer(x, bk_size=100)
+def create_resnet(nb_classes, input_size, depth=40, nb_res_block=3, bk_size=100,
+                  dropout_rate=None, weight_decay=1E-4):
+    inpt = Input(shape=(input_size,))
+    assert (depth-4) % 3 == 0
 
-# resblock 2
-x = resblock(x, bk_size=100)
+    # layers in each res block
+    nb_layers = int((depth-4)/3)
 
-# output
-out = add_layer(x, bk_size=output_size)
+    # initial input
+    x = add_layer(inpt, dropout_rate=dropout_rate, bk_size=bk_size)
+    x = BatchNormalization(axis=-1, momentum=0.99, gamma_regularizer=l2(weight_decay),
+                           beta_regularizer=l2(weight_decay))(x)
 
-model = Model(inpt, out)
+    # Add res block
+    for block_idx in range(nb_res_block-1):
+        x, bk_size = resblock(x, nb_layers, bk_size)
+        x = transition_block(x, bk_size=bk_size, dropout_rate=dropout_rate, weight_decay=weight_decay)
+
+    # The last res block doesnot have a transition block
+    x, bk_size = resblock(x, nb_layers, bk_size, dropout_rate, weight_decay)
+    x = Activation('relu')(x)
+
+    # softmax layer
+    x = Dense(nb_classes, activation='softmax', kernel_initializer='he_normal',
+              kernel_regularizer=l2(weight_decay), bias_regularizer=l2(weight_decay))(x)
+
+    resnet = Model(inputs=inpt, outputs=x)
+
+    return resnet
+
+model = create_resnet(nb_classes=output_size, input_size=input_size, depth=40, bk_size=64, dropout_rate=0.5)
 
 model.compile(optimizer='adam', loss='mse', metrics=['accuracy'])
-model.fit(train_X, train_y, epochs=50, batch_size=1000)
+model.fit(train_X, train_y, epochs=100, batch_size=1000)
 score = model.evaluate(test_X, test_y)
-print(score)
+print('\n', score)
